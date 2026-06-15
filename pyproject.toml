@@ -24,5 +24,8 @@ dev = [
 [project.scripts]
 pkm = "pkm.cli:app"
 
+[tool.setuptools.packages.find]
+include = ["pkm*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
