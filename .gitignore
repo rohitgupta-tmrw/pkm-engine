@@ -1,0 +1,9 @@
+pkm.db
+*.db
+.env
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+*.egg-info/
+.venv/

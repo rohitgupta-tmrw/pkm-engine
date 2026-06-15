@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pkm"
+version = "0.1.0"
+description = "AI-assisted Personal Knowledge Management pipeline"
+requires-python = ">=3.11"
+dependencies = [
+    "libsql-experimental",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "anthropic>=0.25",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+]
+
+[project.scripts]
+pkm = "pkm.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
