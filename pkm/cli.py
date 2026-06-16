@@ -1,0 +1,131 @@
+"""
+pkm CLI entry point.
+
+Entry point: pkm.cli:app (see pyproject.toml [project.scripts]).
+app() is a zero-argument callable so the console_scripts entry point works.
+
+Usage:
+    pkm --help
+    pkm ingest --help
+    pkm ingest --new-only --raw <path>
+
+Security (T-03-07, T-03-09):
+    - --raw path is read as a file; no shell interpolation occurs.
+    - Settings (including ANTHROPIC_API_KEY) are never printed to stdout/stderr.
+    - Only the run_ingest result dict (ids, paths, counts) is printed as JSON.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    """Build and return the top-level argument parser."""
+    parser = argparse.ArgumentParser(
+        prog="pkm",
+        description="AI-assisted Personal Knowledge Management pipeline.",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", metavar="subcommand")
+
+    # -- ingest subcommand ----------------------------------------------------
+    ingest_parser = subparsers.add_parser(
+        "ingest",
+        help="Ingest a raw capture through the full PKM pipeline.",
+        description=(
+            "Run a raw Markdown file through Reader → Summarizer → "
+            "ConceptExtractor → KGAgent → vault writer."
+        ),
+    )
+    ingest_parser.add_argument(
+        "--new-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip sources that have already been fully processed "
+            "(idempotent re-run protection). Recommended for normal use."
+        ),
+    )
+    ingest_parser.add_argument(
+        "--raw",
+        metavar="PATH",
+        required=True,
+        help="Path to the raw Markdown capture file to ingest.",
+    )
+
+    return parser
+
+
+def app() -> None:
+    """PKM CLI entry point. Called by the `pkm` console script."""
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    if args.subcommand is None:
+        parser.print_help()
+        sys.exit(0)
+
+    if args.subcommand == "ingest":
+        _cmd_ingest(args)
+    else:
+        parser.print_help()
+        sys.exit(1)
+
+
+def _cmd_ingest(args: argparse.Namespace) -> None:
+    """Execute the ingest subcommand."""
+    # Late imports: keep startup fast for --help; only load heavy deps when actually ingesting.
+    from pkm.config import Settings
+    from pkm.llm.client import LLMClient
+    from pkm.pipeline.ingest import run_ingest
+    from pkm.store.registry import connect
+
+    # Load settings (from .env or environment variables)
+    settings = Settings()
+
+    # Validate required settings
+    if not settings.anthropic_api_key:
+        print(
+            "ERROR: ANTHROPIC_API_KEY is not set. "
+            "Add it to your .env file or set the environment variable.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    if not settings.vault_path:
+        print(
+            "ERROR: VAULT_PATH is not set. "
+            "Add it to your .env file or set the VAULT_PATH environment variable.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # Read the raw file
+    raw_path_str = args.raw
+    raw_file = Path(raw_path_str)
+    if not raw_file.exists():
+        print(f"ERROR: Raw file not found: {raw_path_str}", file=sys.stderr)
+        sys.exit(1)
+
+    raw_text = raw_file.read_text(encoding="utf-8")
+    vault_root = Path(settings.vault_path)
+
+    # Set up DB and LLM client
+    conn = connect(settings)
+    llm_client = LLMClient(conn, settings.anthropic_api_key)
+
+    # Run the pipeline
+    result = run_ingest(
+        conn=conn,
+        llm_client=llm_client,
+        vault_root=vault_root,
+        raw_text=raw_text,
+        raw_path=raw_path_str,
+        new_only=args.new_only,
+    )
+
+    # Print result as JSON (T-03-09: never echo Settings or api_key)
+    print(json.dumps(result, indent=2))
