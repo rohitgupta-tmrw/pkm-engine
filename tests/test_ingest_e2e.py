@@ -14,11 +14,11 @@ import datetime
 import re
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from pkm.pipeline.ingest import run_ingest
+from pkm.pipeline.ingest import _has_prior_agent_runs, run_ingest
 from pkm.schemas.agent_io import (
     ConceptExtractorOutput,
     ConceptMatch,
@@ -356,3 +356,257 @@ class TestIngestRerUnIsNoop:
         assert new_llm_calls == 0, (
             f"Expected 0 new LLM calls on re-run, got {new_llm_calls}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for CR-03, CR-02, CR-04 (gap-closure plan 03-04)
+# ---------------------------------------------------------------------------
+
+
+class TestPartialRunRecovery:
+    """CR-03: _has_prior_agent_runs must require ALL four agents, not just one."""
+
+    def test_has_prior_agent_runs_requires_all_four(self, db_conn):
+        """Unit test: 1, 2, 3 agents -> False; all 4 -> True."""
+        from pkm.ingest.hashing import sha256_content, source_id_from_hash
+        from pkm.store.registry import upsert_source
+
+        raw_text = _load_raw_text()
+        content_hash = sha256_content(raw_text)
+        source_id = source_id_from_hash(content_hash)
+        now = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+
+        # Insert the source row so FK constraints pass
+        upsert_source(db_conn, {
+            "id": source_id,
+            "content_hash": content_hash,
+            "type": "Article",
+            "title": "Test",
+            "author": "",
+            "url": "",
+            "date_saved": now,
+            "raw_path": "raw/test.md",
+            "status": "captured",
+            "created_at": now,
+            "updated_at": now,
+        })
+
+        all_roles = ("reader_agent", "summarizer_agent", "concept_extractor", "kg_agent")
+
+        # 0 agents -> False
+        assert _has_prior_agent_runs(db_conn, source_id) is False
+
+        # Insert 1, 2, 3 agents and verify still False each time
+        for i, role in enumerate(all_roles[:3]):
+            run_id = "run_" + uuid.uuid4().hex[:20]
+            db_conn.execute(
+                "INSERT OR REPLACE INTO agent_runs "
+                "(id, agent, source_id, input_hash, model, "
+                "tokens_in, tokens_out, cost_usd, status, error, started_at, finished_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run_id, role, source_id, f"hash_{role}", "mock", 1, 1, 0.0, "ok", None, now, now),
+            )
+            db_conn.commit()
+            assert _has_prior_agent_runs(db_conn, source_id) is False, (
+                f"Expected False with {i + 1} agent(s), got True"
+            )
+
+        # Insert the 4th agent -> True
+        run_id = "run_" + uuid.uuid4().hex[:20]
+        db_conn.execute(
+            "INSERT OR REPLACE INTO agent_runs "
+            "(id, agent, source_id, input_hash, model, "
+            "tokens_in, tokens_out, cost_usd, status, error, started_at, finished_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, "kg_agent", source_id, "hash_kg_agent", "mock", 1, 1, 0.0, "ok", None, now, now),
+        )
+        db_conn.commit()
+        assert _has_prior_agent_runs(db_conn, source_id) is True
+
+    def test_partial_run_not_skipped_on_new_only(self, db_conn, tmp_path):
+        """CR-03: A source with only reader_agent ok is NOT short-circuited (deduped=False)."""
+        from pkm.ingest.hashing import sha256_content, source_id_from_hash
+        from pkm.store.registry import upsert_source
+
+        raw_text = _load_raw_text()
+        content_hash = sha256_content(raw_text)
+        source_id = source_id_from_hash(content_hash)
+        now = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        (vault_root / "wiki" / "sources").mkdir(parents=True)
+        (vault_root / "wiki" / "concepts").mkdir(parents=True)
+
+        # Manually insert source row + one reader_agent ok row (simulates interrupted run)
+        upsert_source(db_conn, {
+            "id": source_id,
+            "content_hash": content_hash,
+            "type": "Article",
+            "title": "Operating Leverage and Business Scalability",
+            "author": "",
+            "url": "",
+            "date_saved": now,
+            "raw_path": "raw/2026/06/e2e_article.md",
+            "status": "captured",
+            "created_at": now,
+            "updated_at": now,
+        })
+        run_id = "run_" + uuid.uuid4().hex[:20]
+        db_conn.execute(
+            "INSERT OR REPLACE INTO agent_runs "
+            "(id, agent, source_id, input_hash, model, "
+            "tokens_in, tokens_out, cost_usd, status, error, started_at, finished_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, "reader_agent", source_id, "hash_reader", "mock", 1, 1, 0.0, "ok", None, now, now),
+        )
+        db_conn.commit()
+
+        # Run ingest with multi-agent mock — should NOT short-circuit (deduped=False)
+        mock_llm = _build_multi_agent_mock(db_conn)
+        result = run_ingest(
+            conn=db_conn,
+            llm_client=mock_llm,
+            vault_root=vault_root,
+            raw_text=raw_text,
+            raw_path="raw/2026/06/e2e_article.md",
+            new_only=True,
+        )
+        assert result["deduped"] is False, (
+            "Expected deduped=False for partial run (only reader_agent), "
+            f"but got deduped={result['deduped']}"
+        )
+
+
+class TestSourceTypeNormalization:
+    """CR-02: source_type must normalize to a CHECK-valid value before DB insert."""
+
+    def _run_with_type(self, raw_type: str, db_conn, tmp_path) -> str:
+        """Build a minimal raw document with the given type field and run ingest."""
+        raw_text = (
+            f"---\ntitle: Type Test\ntype: {raw_type}\ndate_saved: 2026-01-01T00:00:00Z\n---\n"
+            "Some body content for type normalization test.\n"
+        )
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir(exist_ok=True)
+        (vault_root / "wiki" / "sources").mkdir(parents=True, exist_ok=True)
+        (vault_root / "wiki" / "concepts").mkdir(parents=True, exist_ok=True)
+
+        mock_llm = _build_multi_agent_mock_for_text(db_conn, raw_text)
+        result = run_ingest(
+            conn=db_conn,
+            llm_client=mock_llm,
+            vault_root=vault_root,
+            raw_text=raw_text,
+            raw_path=f"raw/type_test_{raw_type.replace(' ', '_')}.md",
+            new_only=False,
+        )
+        row = db_conn.execute(
+            "SELECT type FROM sources WHERE id = ?", (result["source_id"],)
+        ).fetchone()
+        assert row is not None
+        return row[0]
+
+    def test_lowercase_type_normalizes(self, db_conn, tmp_path):
+        """CR-02: 'article' (lowercase) normalizes to 'Article'."""
+        result_type = self._run_with_type("article", db_conn, tmp_path)
+        assert result_type == "Article", f"Expected 'Article', got '{result_type}'"
+
+    def test_invalid_type_falls_back_to_article(self, db_conn, tmp_path):
+        """CR-02: 'Blog Post' (not in CHECK set) normalizes to 'Article'."""
+        result_type = self._run_with_type("Blog Post", db_conn, tmp_path)
+        assert result_type == "Article", f"Expected 'Article' fallback, got '{result_type}'"
+
+
+class TestRollbackAtomicity:
+    """CR-04: A mid-run failure must roll back ALL DB writes from Steps 4-8."""
+
+    def test_chunk_rollback_on_claim_insert_failure(self, db_conn, tmp_path):
+        """CR-04: chunks inserted in Step 4 are rolled back when insert_claim raises."""
+        from pkm.ingest.hashing import sha256_content, source_id_from_hash
+
+        raw_text = _load_raw_text()
+        content_hash = sha256_content(raw_text)
+        source_id = source_id_from_hash(content_hash)
+
+        vault_root = tmp_path / "vault"
+        vault_root.mkdir()
+        (vault_root / "wiki" / "sources").mkdir(parents=True)
+        (vault_root / "wiki" / "concepts").mkdir(parents=True)
+
+        mock_llm = _build_multi_agent_mock(db_conn)
+
+        # Patch insert_claim to raise on first call (Step 6 — after chunks written in Step 4)
+        with patch("pkm.pipeline.ingest.insert_claim", side_effect=RuntimeError("forced failure")):
+            with pytest.raises(RuntimeError, match="forced failure"):
+                run_ingest(
+                    conn=db_conn,
+                    llm_client=mock_llm,
+                    vault_root=vault_root,
+                    raw_text=raw_text,
+                    raw_path="raw/2026/06/e2e_article.md",
+                    new_only=False,
+                )
+
+        # Chunks should have been rolled back (0 rows despite Step 4 executing first)
+        chunk_count = db_conn.execute(
+            "SELECT COUNT(*) FROM chunks WHERE source_id = ?", (source_id,)
+        ).fetchone()[0]
+        assert chunk_count == 0, (
+            f"Expected 0 chunks after rollback, got {chunk_count} — partial state was committed"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helper: multi-agent mock for arbitrary raw text (used by source_type tests)
+# ---------------------------------------------------------------------------
+
+def _build_multi_agent_mock_for_text(conn, raw_text: str) -> MagicMock:
+    """Like _build_multi_agent_mock but accepts arbitrary raw_text instead of fixture."""
+    from pkm.ingest.hashing import sha256_content, source_id_from_hash, chunk_id as _chunk_id
+
+    content_hash = sha256_content(raw_text)
+    source_hash12 = content_hash[:12]
+    first_chunk_id = _chunk_id(source_hash12, 0)
+
+    summarizer_result = _make_summarizer_output(first_chunk_id)
+    extractor_result = _make_extractor_output(first_chunk_id)
+    kg_result = _make_kg_output()
+
+    results_by_agent = {
+        "reader_agent": raw_text,
+        "summarizer_agent": summarizer_result,
+        "concept_extractor": extractor_result,
+        "kg_agent": kg_result,
+    }
+
+    mock_client = MagicMock()
+
+    def _mock_call(**kwargs):
+        agent_name = kwargs.get("agent_name", "unknown_agent")
+        run_id = "run_" + uuid.uuid4().hex[:20]
+        now = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+        source_id = kwargs.get("source_id")
+        conn.execute(
+            "INSERT OR REPLACE INTO agent_runs "
+            "(id, agent, source_id, input_hash, model, "
+            "tokens_in, tokens_out, cost_usd, status, error, started_at, finished_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                run_id, agent_name, source_id,
+                "test_hash_" + agent_name[:8],
+                "mock_model", 10, 20, 0.0, "ok", None, now, now,
+            ),
+        )
+        conn.commit()
+        result = results_by_agent.get(agent_name, "")
+        return {
+            "cached": False,
+            "input_hash": "test_hash_" + agent_name[:8],
+            "result": result,
+            "tokens_in": 10,
+            "tokens_out": 20,
+        }
+
+    mock_client.call.side_effect = _mock_call
+    return mock_client
