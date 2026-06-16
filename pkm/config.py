@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     cf_account_id: str = ""
     cf_api_token: str = ""
     db_path: str = "pkm.db"
+    vault_path: str = ""  # Path to pkm-vault root; passed to vault writer; set via VAULT_PATH env or CLI flag
 
 
 settings = Settings()
